@@ -25,6 +25,8 @@ import org.wso2.carbon.identity.agent.onprem.userstore.constant.LDAPConstants;
 import org.wso2.carbon.identity.agent.onprem.userstore.exception.UserStoreException;
 import org.wso2.carbon.identity.agent.onprem.userstore.manager.common.UserStoreManager;
 import org.wso2.carbon.identity.agent.onprem.userstore.util.JNDIUtil;
+import org.wso2.carbon.identity.agent.onprem.userstore.util.UserDNCache;
+import java.io.UnsupportedEncodingException;
 import java.text.MessageFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -58,6 +60,7 @@ public class LDAPUserStoreManager implements UserStoreManager {
     private static final String PROPERTY_REFERRAL_IGNORE = "ignore";
     private static final String MEMBER_UID = "memberUid";
     private LDAPConnectionContext connectionSource;
+    private UserDNCache userDNCache;
 
     public LDAPUserStoreManager(){
     }
@@ -72,6 +75,11 @@ public class LDAPUserStoreManager implements UserStoreManager {
         // check if required configurations are in the user-mgt.xml
         checkRequiredUserStoreConfigurations();
         this.connectionSource = new LDAPConnectionContext(this.userStoreProperties);
+        userDNCache = UserDNCache.getInstance();
+        if (!"true".equals(userStoreProperties.get(CommonConstants.
+               PROPERTY_USER_DN_CACHE_ENABLED))) {
+            userDNCache.disableCache();
+        }
     }
 
     /**
@@ -148,6 +156,13 @@ public class LDAPUserStoreManager implements UserStoreManager {
                     "Required MembershipAttribute property is not set at the LDAP configurations");
         }
 
+        String isUserDNCacheEnabled =
+                userStoreProperties.get(CommonConstants.PROPERTY_USER_DN_CACHE_ENABLED);
+        if (isUserDNCacheEnabled == null || isUserDNCacheEnabled.trim().length() == 0) {
+            throw new UserStoreException(
+                    "Required UserDNCacheEnabled property is not set at the LDAP configurations");
+        }
+
     }
 
     /**
@@ -156,6 +171,7 @@ public class LDAPUserStoreManager implements UserStoreManager {
     public boolean doAuthenticate(String userName, Object credential) throws UserStoreException {
 
         boolean debug = log.isDebugEnabled();
+        String failedUserDN = null;
 
         if (userName == null || credential == null) {
             return false;
@@ -176,6 +192,31 @@ public class LDAPUserStoreManager implements UserStoreManager {
 
         boolean bValue = false;
         String name;
+        Object ldnObj = userDNCache.get(userName);
+        if (ldnObj != null) {
+            LdapName ldn = (LdapName) ldnObj;
+            name = ldn.toString();
+            try {
+                if (debug) {
+                    log.debug("Cache hit. Using DN " + name);
+                }
+                bValue = this.bindAsUser(name, (String) credential);
+            } catch (NamingException e) {
+                // do nothing if bind fails since we check for other DN
+                // patterns as well.
+                if (log.isDebugEnabled()) {
+                    log.debug("Checking authentication with UserDN " + name + "failed " +
+                            e.getMessage(), e);
+                }
+            }
+
+            if (bValue) {
+                return bValue;
+            }
+            // we need not check binding for this name again, so store this and check
+            failedUserDN = name;
+
+        }
         // read DN patterns from user-mgt.xml
         String patterns = userStoreProperties.get(LDAPConstants.USER_DN_PATTERN);
 
@@ -192,13 +233,22 @@ public class LDAPUserStoreManager implements UserStoreManager {
                 for (String userDNPattern : userDNPatternList) {
                     name = MessageFormat.format(userDNPattern, escapeSpecialCharactersForDN(userName));
 
+                    // check if the same name is found and checked from cache
+                    if (failedUserDN != null && failedUserDN.equalsIgnoreCase(name)) {
+                        continue;
+                    }
+
                     if (debug) {
                         log.debug("Authenticating with " + name);
                     }
                     try {
-                        bValue = this.bindAsUser(name, (String) credential);
-                        if (bValue) {
-                            break;
+                        if (name != null) {
+                            bValue = this.bindAsUser(name, (String) credential);
+                            if (bValue) {
+                                LdapName ldapName = new LdapName(name);
+                                userDNCache.addToCache(userName, ldapName);
+                                break;
+                            }
                         }
                     } catch (NamingException e) {
                         // do nothing if bind fails since we check for other DN
@@ -218,6 +268,10 @@ public class LDAPUserStoreManager implements UserStoreManager {
                         log.debug("Authenticating with " + name);
                     }
                     bValue = this.bindAsUser(name, (String) credential);
+                    if (bValue) {
+                        LdapName ldapName = new LdapName(name);
+                        userDNCache.addToCache(userName, ldapName);
+                    }
                 }
             } catch (NamingException e) {
                 String errorMessage = "Cannot bind user : " + userName;
@@ -240,21 +294,34 @@ public class LDAPUserStoreManager implements UserStoreManager {
 
         String userAttributeSeparator = ",";
         String userDN = null;
+        Object ldnObj = userDNCache.get(userName);
 
-        // read list of patterns from user-mgt.xml
-        String patterns = userStoreProperties.get(LDAPConstants.USER_DN_PATTERN);
+        if (ldnObj == null) {
+            // read list of patterns from user-mgt.xml
+            String patterns = userStoreProperties.get(LDAPConstants.USER_DN_PATTERN);
+            if (patterns != null && !patterns.isEmpty()) {
 
-        if (patterns != null && !patterns.isEmpty()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Using User DN Patterns " + patterns);
+                }
 
-            if (log.isDebugEnabled()) {
-                log.debug("Using User DN Patterns " + patterns);
+                if (patterns.contains(CommonConstants.XML_PATTERN_SEPERATOR)) {
+                    userDN = getNameInSpaceForUserName(userName);
+                } else {
+                    userDN = MessageFormat.format(patterns, escapeSpecialCharactersForDN(userName));
+                    try {
+                        LdapName ldapName = new LdapName(userDN);
+                        userDNCache.addToCache(userName, ldapName);
+                    } catch (InvalidNameException ex) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("DN of the user retrieved from the pattern has a invalid syntax.");
+                        }
+                    }
+                }
             }
-
-            if (patterns.contains(CommonConstants.XML_PATTERN_SEPERATOR)) {
-                userDN = getNameInSpaceForUserName(userName);
-            } else {
-                userDN = MessageFormat.format(patterns, escapeSpecialCharactersForDN(userName));
-            }
+        } else {
+            LdapName ldn = (LdapName) ldnObj;
+            userDN = ldn.toString();
         }
 
 
@@ -314,7 +381,7 @@ public class LDAPUserStoreManager implements UserStoreManager {
                                         attr = (String) attObject;
                                     } else if (attObject instanceof byte[]) {
                                         //if the attribute type is binary base64 encoded string will be returned
-                                        attr = new String(Base64.encodeBase64((byte[]) attObject));
+                                        attr = new String(Base64.encodeBase64((byte[]) attObject), "UTF-8");
                                     }
 
                                     if (attr != null && attr.trim().length() > 0) {
@@ -345,6 +412,12 @@ public class LDAPUserStoreManager implements UserStoreManager {
 
         } catch (NamingException e) {
             String errorMessage = "Error occurred while getting user property values for user : " + userName;
+            if (log.isDebugEnabled()) {
+                log.debug(errorMessage, e);
+            }
+            throw new UserStoreException(errorMessage, e);
+        } catch (UnsupportedEncodingException e) {
+            String errorMessage = "Error occurred while Base64 encoding attribute for : " + userName;
             if (log.isDebugEnabled()) {
                 log.debug(errorMessage, e);
             }
@@ -814,6 +887,8 @@ public class LDAPUserStoreManager implements UserStoreManager {
                     }
                 }
             }
+            LdapName ldapName = new LdapName(userDN);
+            userDNCache.addToCache(userName, ldapName);
             if (debug) {
                 log.debug("Name in space for " + userName + " is " + userDN);
             }
@@ -1065,6 +1140,11 @@ public class LDAPUserStoreManager implements UserStoreManager {
         // check if required configurations are in the user-mgt.xml
         checkRequiredUserStoreConfigurations();
         this.connectionSource = new LDAPConnectionContext(this.userStoreProperties);
+        userDNCache = UserDNCache.getInstance();
+        if (!"true".equals(userStoreProperties.get(CommonConstants.
+                PROPERTY_USER_DN_CACHE_ENABLED))) {
+            userDNCache.disableCache();
+        }
     }
 
 
@@ -1092,13 +1172,29 @@ public class LDAPUserStoreManager implements UserStoreManager {
                 userStoreProperties.get(LDAPConstants.MEMBERSHIP_ATTRIBUTE);
         String userDNPattern = userStoreProperties.get(LDAPConstants.USER_DN_PATTERN);
         String nameInSpace;
-        if (userDNPattern != null && userDNPattern.trim().length() > 0
-                && !userDNPattern.contains(CommonConstants.XML_PATTERN_SEPERATOR)) {
+        Object ldnObj = userDNCache.get(userName);
+        if (ldnObj == null) {
+            if (userDNPattern != null && userDNPattern.trim().length() > 0
+                    && !userDNPattern.contains(CommonConstants.XML_PATTERN_SEPERATOR)) {
 
-            nameInSpace = MessageFormat.format(userDNPattern, escapeSpecialCharactersForDN(userName));
+                nameInSpace = MessageFormat.format(userDNPattern, escapeSpecialCharactersForDN(userName));
+                try {
+                    LdapName ldapName = new LdapName(nameInSpace);
+                    userDNCache.addToCache(userName, ldapName);
+                } catch (InvalidNameException ex) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("DN of the user retrieved from the pattern has a invalid syntax.");
+                    }
+                }
+            } else {
+                nameInSpace = this.getNameInSpaceForUserName(userName);
+            }
         } else {
-            nameInSpace = this.getNameInSpaceForUserName(userName);
+            LdapName ldname = (LdapName) ldnObj;
+            nameInSpace = ldname.toString();
         }
+
+
 
         String membershipValue;
         if (nameInSpace != null) {
@@ -1239,17 +1335,17 @@ public class LDAPUserStoreManager implements UserStoreManager {
         }
 
         if (replaceEscapeCharacters) {
-            String escapedDN = "";
+            StringBuilder escapedDN = new StringBuilder("");
             for (int i = ldn.size() - 1; i > -1; i--) { //escaping the rdns separately and re-constructing the DN
-                escapedDN = escapedDN + escapeSpecialCharactersForFilterWithStarAsRegex(ldn.get(i));
+                escapedDN = escapedDN.append(escapeSpecialCharactersForFilterWithStarAsRegex(ldn.get(i)));
                 if (i != 0) {
-                    escapedDN += ",";
+                    escapedDN.append(",");
                 }
             }
             if (log.isDebugEnabled()) {
                 log.debug("Escaped DN value for filter : " + escapedDN);
             }
-            return escapedDN;
+            return escapedDN.toString();
         } else {
             return ldn.toString();
         }

@@ -45,7 +45,7 @@ import javax.ws.rs.core.Response;
  *  Users REST endpoint.
  *  This will be available at https://localhost:8888/users
  */
-@Api(value = "users")
+@Api(value = CommonConstants.AGENT_BASE_URL + "users")
 @SwaggerDefinition(
         info = @Info(
                 title = "Users Endpoint Swagger Definition", version = "1.0",
@@ -53,7 +53,7 @@ import javax.ws.rs.core.Response;
                 license = @License(name = "Apache 2.0", url = "http://www.apache.org/licenses/LICENSE-2.0")
         )
 )
-@Path("/users")
+@Path(CommonConstants.AGENT_BASE_URL + "/users")
 public class UserResource {
     private static Logger log = LoggerFactory.getLogger(UserResource.class);
 
